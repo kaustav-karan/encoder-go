@@ -144,7 +144,7 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "Failed to create temp directory", http.StatusInternalServerError)
         return
     }
-    defer os.RemoveAll(workingDir)
+    defer+ os.RemoveAll(workingDir)
 
     // Download input file
     inputPath := filepath.Join(workingDir, "input.mp3")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -60,139 +61,162 @@ func main() {
 }
 
 func uploadToMinio(folder string, objectPrefix string) error {
-    ctx := context.Background()
+	ctx := context.Background()
 
-    client, err := minio.New(minioEndpoint, &minio.Options{
-        Creds:  credentials.NewStaticV4(minioAccessKey, minioSecretKey, ""),
-        Secure: useSSL,
-    })
-    if err != nil {
-        return err
-    }
+	client, err := minio.New(minioEndpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(minioAccessKey, minioSecretKey, ""),
+		Secure: useSSL,
+	})
+	if err != nil {
+		return err
+	}
 
-    exists, err := client.BucketExists(ctx, minioBucket)
-    if err != nil {
-        return err
-    }
-    if !exists {
-        err = client.MakeBucket(ctx, minioBucket, minio.MakeBucketOptions{})
-        if err != nil {
-            return err
-        }
-    }
+	exists, err := client.BucketExists(ctx, minioBucket)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		err = client.MakeBucket(ctx, minioBucket, minio.MakeBucketOptions{})
+		if err != nil {
+			return err
+		}
+	}
 
-    // Create the folder structure by ensuring the prefix ends with /
-    if !strings.HasSuffix(objectPrefix, "/") {
-        objectPrefix = objectPrefix + "/"
-    }
+	// Create the folder structure by ensuring the prefix ends with /
+	if !strings.HasSuffix(objectPrefix, "/") {
+		objectPrefix = objectPrefix + "/"
+	}
 
-    entries, err := os.ReadDir(folder)
-    if err != nil {
-        return err
-    }
+	entries, err := os.ReadDir(folder)
+	if err != nil {
+		return err
+	}
 
-    for _, entry := range entries {
-        if entry.IsDir() {
-            continue
-        }
-        
-        // Simplified file naming
-        var objectName string
-        switch {
-        case strings.Contains(entry.Name(), "input"):
-            objectName = objectPrefix + "input.mp3"
-        case strings.Contains(entry.Name(), "output"):
-            objectName = objectPrefix + "output.m3u8"
-        case strings.Contains(entry.Name(), "segment"):
-            objectName = objectPrefix + entry.Name() // keeps segment_001.ts etc.
-        default:
-            objectName = objectPrefix + entry.Name()
-        }
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
 
-        filePath := filepath.Join(folder, entry.Name())
-        
-        // Set appropriate content types
-        opts := minio.PutObjectOptions{}
-        if strings.HasSuffix(objectName, ".m3u8") {
-            opts.ContentType = "application/vnd.apple.mpegurl"
-        } else if strings.HasSuffix(objectName, ".ts") {
-            opts.ContentType = "video/MP2T"
-        }
+		// Simplified file naming
+		var objectName string
+		switch {
+		case strings.Contains(entry.Name(), "input"):
+			objectName = objectPrefix + "input.mp3"
+		case strings.Contains(entry.Name(), "output"):
+			objectName = objectPrefix + "output.m3u8"
+		case strings.Contains(entry.Name(), "segment"):
+			objectName = objectPrefix + entry.Name() // keeps segment_001.ts etc.
+		default:
+			objectName = objectPrefix + entry.Name()
+		}
 
-        _, err := client.FPutObject(ctx, minioBucket, objectName, filePath, opts)
-        if err != nil {
-            log.Println("Upload failed for:", filePath, err)
-            return err
-        }
-        log.Println("Uploaded:", objectName)
-    }
+		filePath := filepath.Join(folder, entry.Name())
 
-    return nil
+		// Set appropriate content types
+		opts := minio.PutObjectOptions{}
+		if strings.HasSuffix(objectName, ".m3u8") {
+			opts.ContentType = "application/vnd.apple.mpegurl"
+		} else if strings.HasSuffix(objectName, ".ts") {
+			opts.ContentType = "video/MP2T"
+		}
+
+		_, err := client.FPutObject(ctx, minioBucket, objectName, filePath, opts)
+		if err != nil {
+			log.Println("Upload failed for:", filePath, err)
+			return err
+		}
+		log.Println("Uploaded:", objectName)
+	}
+
+	return nil
 }
 
 func handleConvert(w http.ResponseWriter, r *http.Request) {
-    presignedURL := r.URL.Query().Get("url")
-    if presignedURL == "" {
-        http.Error(w, "Missing 'url' query parameter", http.StatusBadRequest)
-        return
-    }
+	var request struct {
+		PresignedUrl string `json:"presignedUrl"`
+		RefID        string `json:"refID"`
+	}
 
-    // Create working directory with simple name
-    workingDir := filepath.Join(os.TempDir(), "hls-conversion")
-    err := os.MkdirAll(workingDir, 0755)
-    if err != nil {
-        http.Error(w, "Failed to create temp directory", http.StatusInternalServerError)
-        return
-    }
-    defer+ os.RemoveAll(workingDir)
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	presignedUrl := request.PresignedUrl
+	refID := request.RefID
 
-    // Download input file
-    inputPath := filepath.Join(workingDir, "input.mp3")
-    err = downloadFile(inputPath, presignedURL)
-    if err != nil {
-        http.Error(w, "Failed to download file: "+err.Error(), http.StatusInternalServerError)
-        return
-    }
+	if presignedUrl == "" {
+		http.Error(w, "Missing presignedUrl", http.StatusBadRequest)
+		return
+	}
 
-    // Convert to HLS
-    outputPath := filepath.Join(workingDir, "output.m3u8")
-    segmentPattern := filepath.Join(workingDir, "segment_%03d.ts")
-    cmd := exec.Command("ffmpeg",
-        "-i", inputPath,
-        "-c:a", "aac", "-b:a", "192k",
-        "-f", "hls",
-        "-hls_time", "5",
-        "-hls_list_size", "0",
-        "-hls_flags", "independent_segments+append_list",
-        "-hls_segment_filename", segmentPattern,
-        outputPath,
-    )
-    cmd.Stdout = os.Stdout
-    cmd.Stderr = os.Stderr
-    err = cmd.Run()
-    if err != nil {
-        http.Error(w, "FFmpeg conversion failed: "+err.Error(), http.StatusInternalServerError)
-        return
-    }
+	// Create working directory with simple name
+	workingDir := filepath.Join(os.TempDir(), "hls-conversion")
+	err := os.MkdirAll(workingDir, 0755)
+	if err != nil {
+		http.Error(w, "Failed to create temp directory", http.StatusInternalServerError)
+		return
+	}
+	defer os.RemoveAll(workingDir)
 
-    // Upload to MinIO with simple folder structure
-    folderName := "converted-audio/" // Fixed folder name
-    err = uploadToMinio(workingDir, folderName)
-    if err != nil {
-        http.Error(w, "Upload to MinIO failed: "+err.Error(), http.StatusInternalServerError)
-        return
-    }
+	// Download input file
+	inputPath := filepath.Join(workingDir, "input.mp3")
+	err = downloadFile(inputPath, presignedUrl)
+	if err != nil {
+		http.Error(w, "Failed to download file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-    protocol := "http"
-    if useSSL {
-        protocol = "https"
-    }
+	// Convert to HLS
+	outputPath := filepath.Join(workingDir, "output.m3u8")
+	segmentPattern := filepath.Join(workingDir, "segment_%03d.ts")
+	cmd := exec.Command("ffmpeg",
+		"-i", inputPath,
+		"-c:a", "aac", "-b:a", "192k",
+		"-f", "hls",
+		"-hls_time", "5",
+		"-hls_list_size", "0",
+		"-hls_flags", "independent_segments+append_list",
+		"-hls_segment_filename", segmentPattern,
+		outputPath,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		http.Error(w, "FFmpeg conversion failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-    // Generate the public URL
-    publicM3U8URL := fmt.Sprintf("%s://%s/%s/%soutput.m3u8", protocol, minioEndpoint, minioBucket, folderName)
-    log.Println("Stream available at:", publicM3U8URL)
-    w.WriteHeader(http.StatusOK)
-    w.Write([]byte(fmt.Sprintf("✅ Conversion successful!\nStream: %s", publicM3U8URL)))
+	// Upload to MinIO with simple folder structure
+	folderName := "converted-audio/" // Fixed folder name
+	err = uploadToMinio(workingDir, folderName)
+	if err != nil {
+		http.Error(w, "Upload to MinIO failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	protocol := "http"
+	if useSSL {
+		protocol = "https"
+	}
+
+	// Generate the public URL
+	publicM3U8URL := fmt.Sprintf("%s://%s/%s/%soutput.m3u8", protocol, minioEndpoint, minioBucket, folderName)
+	log.Println("Stream available at:", publicM3U8URL)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("✅ Conversion successful!\nStream: %s", publicM3U8URL)))
+    
+	//post request with public url and refID to the main server
+	data := fmt.Sprintf(`{"manifestUrl":"%s","refID":"%s"}`, publicM3U8URL, refID)
+	_, err = http.Post(
+		"http://main-server:3000/conversion-complete",
+		"application/json",
+		strings.NewReader(data),
+	)
+	if err != nil {
+		log.Println("Failed to notify main server:", err)
+	}
 }
 
 func downloadFile(filepath string, url string) error {
